@@ -36,34 +36,40 @@ async function getProduct(link) {
   const cur = zone === "us" ? "USD" : "GBP";
   const base = isUS ? `https://www.gymshark.com/products/${handle}` : `https://uk.gymshark.com/products/${handle}`;
 
-  let name = handle.replace(/-/g, " "), price = null, full = null, meta = handle, image = null, sizes = null;
+  let name = handle.replace(/-/g, " "), price = null, full = null, meta = handle, image = null, sizes = null, sizeSource = "none";
+
+  // วิธีที่ 1: Shopify AJAX endpoint แบบมาตรฐาน (ใช้ได้กับร้าน Shopify ทั่วไป ไม่ใช่ Gymshark แต่เผื่อไว้)
   try {
     const r = await fetch(base + ".js", { headers: UA });
     if (r.ok) {
       const p = await r.json();
-      name = p.title || name;
-      meta = [handle, p.title, p.type, (p.tags || []).join(" ")].join(" ");
-      const vs = (p.variants || []);
-      const inStock = vs.filter((v) => v.available !== false);
-      const use = inStock.length ? inStock : vs;
-      price = Math.min(...use.map((v) => v.price)) / 100;
-      const cmp = Math.max(...use.map((v) => v.compare_at_price || 0)) / 100;
-      if (cmp > price) full = cmp;
-      image = p.featured_image || (p.images && p.images[0]) || null;
-      // ไซซ์: ใช้ option สุดท้าย (มักเป็นไซซ์) ของแต่ละ variant พร้อมสถานะมีของ/หมด
-      if (vs.length > 1) {
-        const seen = new Map();
-        for (const v of vs) {
-          const label = v.option3 || v.option2 || v.option1 || v.title;
-          if (!label) continue;
-          const avail = v.available !== false;
-          if (!seen.has(label) || avail) seen.set(label, avail);
+      if (p && Array.isArray(p.variants) && p.variants.length) {
+        name = p.title || name;
+        meta = [handle, p.title, p.type, (p.tags || []).join(" ")].join(" ");
+        const vs = p.variants;
+        const inStock = vs.filter((v) => v.available !== false);
+        const use = inStock.length ? inStock : vs;
+        price = Math.min(...use.map((v) => v.price)) / 100;
+        const cmp = Math.max(...use.map((v) => v.compare_at_price || 0)) / 100;
+        if (cmp > price) full = cmp;
+        image = p.featured_image || (p.images && p.images[0]) || null;
+        if (vs.length > 1) {
+          const seen = new Map();
+          for (const v of vs) {
+            const label = v.option3 || v.option2 || v.option1 || v.title;
+            if (!label) continue;
+            const avail = v.available !== false;
+            if (!seen.has(label) || avail) seen.set(label, avail);
+          }
+          sizes = [...seen.entries()].map(([label, available]) => ({ label, available }));
+          sizeSource = "shopifyjs";
         }
-        sizes = [...seen.entries()].map(([label, available]) => ({ label, available }));
       }
     }
   } catch (e) {}
-  if (price == null || !image) {
+
+  // วิธีที่ 2: อ่าน HTML จริงของหน้าเว็บ (Gymshark ใช้วิธีนี้) ดึงราคา/รูป/ไซซ์จาก JSON-LD ที่ฝังไว้สำหรับ SEO
+  if (price == null || !image || !sizes) {
     try {
       const html = await (await fetch(base, { headers: UA })).text();
       if (price == null) {
@@ -77,12 +83,43 @@ async function getProduct(link) {
                    html.match(/content="([^"]+)"\s+property="og:image/);
         if (im) image = im[1];
       }
+      if (!sizes) {
+        const got = extractSizesFromLdJson(html);
+        if (got && got.length) { sizes = got; sizeSource = "ldjson"; }
+      }
     } catch (e) {}
   }
   if (price == null) throw new Error("อ่านราคาจากหน้าเว็บไม่ได้");
   if (image && image.startsWith("//")) image = "https:" + image;
   if (image) image = image.replace(/^http:/, "https:");
-  return { name, price, full, cur, zone, meta, handle, image, sizes };
+  return { name, price, full, cur, zone, meta, handle, image, sizes, sizeSource };
+}
+
+// ===== ดึงรายชื่อไซซ์ + สถานะมีของ/หมด จาก JSON-LD (schema.org Product) ที่ฝังในหน้าเว็บ =====
+function extractSizesFromLdJson(html) {
+  const blocks = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+  for (const b of blocks) {
+    let data;
+    try { data = JSON.parse(b[1]); } catch (e) { continue; }
+    const items = Array.isArray(data) ? data : [data];
+    for (const item of items) {
+      const types = Array.isArray(item?.["@type"]) ? item["@type"] : [item?.["@type"]];
+      if (!types.includes("Product")) continue;
+      let offers = item.offers;
+      if (offers && offers["@type"] === "AggregateOffer" && Array.isArray(offers.offers)) offers = offers.offers;
+      if (!Array.isArray(offers) || offers.length < 2) continue;
+      const out = [];
+      for (const o of offers) {
+        let label = o.name || o.sku || "";
+        label = String(label).split("/").pop().trim(); // ตัดเอาส่วนท้ายสุด (มักเป็นไซซ์) ถ้าชื่อเต็มเป็น "สี / ไซซ์"
+        if (!label) continue;
+        const avail = /instock/i.test(o.availability || "");
+        out.push({ label, available: avail });
+      }
+      if (out.length > 1) return out;
+    }
+  }
+  return null;
 }
 
 // ===== ตรวจว่าสินค้าอยู่ในหมวดที่บวกเพิ่มไหม (สำหรับลิงก์) =====
@@ -130,6 +167,7 @@ async function quote(link, x) {
   const ex = x ? x : (await detectExtra(p))?.id || "none";
   const q = buildQuote({ name: p.name, image: p.image, price: p.price, cur: p.cur, full: p.full, extraId: ex, sizes: p.sizes });
   q.internal.zone = p.zone.toUpperCase();
+  q.internal.sizeSource = p.sizeSource;
   return q;
 }
 
@@ -265,7 +303,7 @@ function showResult(j, linkForMsg){
     [...$("sizes").children].forEach(el=>{if(el.classList.contains("out"))return;el.onclick=()=>{[...$("sizes").children].forEach(x=>x.classList.remove("on"));el.classList.add("on");selSize=el.dataset.l}});
   } else { $("szwrap").hidden=true; }
   const i=j.internal;$("dt").hidden=!i;
-  if(i)$("d").innerHTML=(i.fromImage?"(อ่านจากรูป) ":"")+"โซน "+i.zone+" · ราคาหน้าร้าน "+i.price+" "+i.cur+(i.full?" (เต็ม "+i.full+")":"")+"<br>"+i.price+" × "+i.rate+" + "+i.fee+(i.extra?" + "+i.extra.amount+" ("+i.extra.label+")":"")+" = "+i.raw.toFixed(1);
+  if(i)$("d").innerHTML=(i.fromImage?"(อ่านจากรูป) ":"")+"โซน "+i.zone+" · ราคาหน้าร้าน "+i.price+" "+i.cur+(i.full?" (เต็ม "+i.full+")":"")+"<br>"+i.price+" × "+i.rate+" + "+i.fee+(i.extra?" + "+i.extra.amount+" ("+i.extra.label+")":"")+" = "+i.raw.toFixed(1)+(i.sizeSource?"<br>ไซซ์: "+(i.sizeSource==="none"?"อ่านไม่ได้":i.sizeSource):"");
   $("r").hidden=false;
 }
 
